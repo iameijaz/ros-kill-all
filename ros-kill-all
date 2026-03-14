@@ -1,0 +1,353 @@
+#!/usr/bin/env bash
+# ============================================================
+# ros-kill-all — Force-clear all ROS2/DDS processes
+#
+# Kills ghost nodes, zombie publishers, leftover DDS
+# participants and daemon processes after a crash or hang.
+#
+# Usage:
+#   ros-kill-all               # kill everything ROS2/DDS
+#   ros-kill-all --dry-run     # show what would be killed
+#   ros-kill-all --node NAME   # kill one node by name
+#   ros-kill-all --daemon      # kill only the ROS2 daemon
+#   ros-kill-all --dds         # kill only DDS middleware
+#   ros-kill-all --list        # list all ROS2/DDS processes
+#   ros-kill-all --help        # show this help
+#
+# Author: Ijaz Ahmed [Verbit]
+# License: MIT
+# ============================================================
+
+set -euo pipefail
+
+VERSION="1.0.0"
+
+# ── Colours ──────────────────────────────────────────────────
+RED='\033[0;31m'
+GRN='\033[0;32m'
+YLW='\033[0;33m'
+BLU='\033[0;34m'
+DIM='\033[2m'
+RST='\033[0m'
+
+# ── Process patterns ─────────────────────────────────────────
+# Each entry is a grep pattern matched against full cmdline
+
+ROS_PATTERNS=(
+    "ros2"
+    "ros-args"
+    "_ros2_daemon"
+    "ros2_daemon"
+    "component_container"
+    "component_container_mt"
+    "component_container_isolated"
+    "ros2_param_server"
+)
+
+DDS_PATTERNS=(
+    "fastrtps"
+    "fastdds"
+    "CycloneDDS"
+    "cyclonedds"
+    "rmw_fastrtps"
+    "rmw_cyclone"
+    "rmw_connext"
+    "connextdds"
+    "opensplice"
+    "gurumdds"
+)
+
+GAZEBO_PATTERNS=(
+    "gzserver"
+    "gzclient"
+    "gz sim"
+    "ign gazebo"
+    "ruby.*gazebo"
+)
+
+# ── Flags ─────────────────────────────────────────────────────
+DRY_RUN=0
+TARGET_NODE=""
+DAEMON_ONLY=0
+DDS_ONLY=0
+LIST_ONLY=0
+INCLUDE_GAZEBO=0
+FORCE=0
+VERBOSE=0
+
+# ── Usage ─────────────────────────────────────────────────────
+usage() {
+    echo -e "${BLU}ros-kill-all${RST} v${VERSION} — Force-clear ROS2/DDS processes\n"
+    echo "Usage: ros-kill-all [options]"
+    echo ""
+    echo "Options:"
+    echo "  --dry-run        Show what would be killed, do nothing"
+    echo "  --node <name>    Kill only the node matching <name>"
+    echo "  --daemon         Kill only the ROS2 daemon"
+    echo "  --dds            Kill only DDS middleware processes"
+    echo "  --gazebo         Also kill Gazebo/Ignition processes"
+    echo "  --list           List all ROS2/DDS processes and exit"
+    echo "  --force          Use SIGKILL instead of SIGTERM"
+    echo "  --verbose        Show full command line of each process"
+    echo "  --version        Print version"
+    echo "  --help           Show this help"
+    echo ""
+    echo "Examples:"
+    echo "  ros-kill-all                  # kill all ROS2 + DDS"
+    echo "  ros-kill-all --dry-run        # preview only"
+    echo "  ros-kill-all --node /slam     # kill one node"
+    echo "  ros-kill-all --daemon         # restart-safe daemon kill"
+    echo "  ros-kill-all --gazebo         # include sim processes"
+    echo "  ros-kill-all --list           # what's running?"
+}
+
+# ── Helpers ───────────────────────────────────────────────────
+
+is_our_process() {
+    # Don't kill ourselves or this script
+    local pid=$1
+    [[ "$pid" == "$$" ]] && return 1
+    [[ "$pid" == "$PPID" ]] && return 1
+    return 0
+}
+
+find_pids_by_pattern() {
+    local pattern="$1"
+    # pgrep -f matches full cmdline, -l shows name
+    pgrep -f "$pattern" 2>/dev/null | while read -r pid; do
+        is_our_process "$pid" && echo "$pid"
+    done
+}
+
+get_cmdline() {
+    local pid=$1
+    cat /proc/$pid/cmdline 2>/dev/null | tr '\0' ' ' | head -c 120
+}
+
+print_process() {
+    local pid=$1
+    local name
+    name=$(ps -p "$pid" -o comm= 2>/dev/null || echo "unknown")
+    if [[ $VERBOSE -eq 1 ]]; then
+        local cmd
+        cmd=$(get_cmdline "$pid")
+        printf "  ${DIM}%-8s${RST} %-20s %s\n" "$pid" "$name" "$cmd"
+    else
+        printf "  ${DIM}%-8s${RST} %s\n" "$pid" "$name"
+    fi
+}
+
+kill_pid() {
+    local pid=$1
+    local sig="TERM"
+    [[ $FORCE -eq 1 ]] && sig="KILL"
+
+    if [[ $DRY_RUN -eq 1 ]]; then
+        echo -e "  ${YLW}[dry-run]${RST} would kill PID $pid"
+        return
+    fi
+
+    if kill -"$sig" "$pid" 2>/dev/null; then
+        echo -e "  ${GRN}✓${RST} killed PID $pid"
+    else
+        echo -e "  ${DIM}✗ PID $pid already gone${RST}"
+    fi
+}
+
+collect_pids() {
+    local -n _arr=$1
+    shift
+    local patterns=("$@")
+    local seen=()
+
+    for pattern in "${patterns[@]}"; do
+        while read -r pid; do
+            # deduplicate
+            local found=0
+            for s in "${seen[@]:-}"; do [[ "$s" == "$pid" ]] && found=1; done
+            [[ $found -eq 0 ]] && _arr+=("$pid") && seen+=("$pid")
+        done < <(find_pids_by_pattern "$pattern")
+    done
+}
+
+# ── Kill ROS2 daemon cleanly ──────────────────────────────────
+kill_daemon() {
+    echo -e "\n${BLU}▸ ROS2 daemon${RST}"
+
+    # Try graceful shutdown first
+    if command -v ros2 &>/dev/null; then
+        if [[ $DRY_RUN -eq 1 ]]; then
+            echo -e "  ${YLW}[dry-run]${RST} would run: ros2 daemon stop"
+        else
+            ros2 daemon stop 2>/dev/null && \
+                echo -e "  ${GRN}✓${RST} daemon stopped gracefully" || \
+                echo -e "  ${DIM}daemon was not running${RST}"
+        fi
+    fi
+
+    # Kill any remaining daemon processes
+    local pids=()
+    collect_pids pids "_ros2_daemon" "ros2_daemon"
+
+    if [[ ${#pids[@]} -eq 0 ]]; then
+        echo -e "  ${DIM}no daemon processes found${RST}"
+        return
+    fi
+
+    for pid in "${pids[@]}"; do
+        print_process "$pid"
+        kill_pid "$pid"
+    done
+}
+
+# ── Main kill logic ───────────────────────────────────────────
+
+kill_by_node_name() {
+    local node="$1"
+    echo -e "\n${BLU}▸ Looking for node: ${node}${RST}"
+
+    local pids=()
+    collect_pids pids "$node"
+
+    if [[ ${#pids[@]} -eq 0 ]]; then
+        echo -e "  ${YLW}no processes found matching '${node}'${RST}"
+        return 1
+    fi
+
+    for pid in "${pids[@]}"; do
+        print_process "$pid"
+        kill_pid "$pid"
+    done
+}
+
+list_processes() {
+    local all_patterns=("${ROS_PATTERNS[@]}" "${DDS_PATTERNS[@]}")
+    [[ $INCLUDE_GAZEBO -eq 1 ]] && all_patterns+=("${GAZEBO_PATTERNS[@]}")
+
+    local pids=()
+    collect_pids pids "${all_patterns[@]}"
+
+    if [[ ${#pids[@]} -eq 0 ]]; then
+        echo -e "${GRN}No ROS2/DDS processes found.${RST}"
+        return
+    fi
+
+    echo -e "${BLU}ROS2/DDS processes (${#pids[@]} found):${RST}\n"
+    echo -e "  ${DIM}PID      NAME                 CMDLINE${RST}"
+    echo -e "  ${DIM}───────────────────────────────────────────────${RST}"
+    VERBOSE=1
+    for pid in "${pids[@]}"; do
+        print_process "$pid"
+    done
+}
+
+kill_all() {
+    local total=0
+    local sections=()
+
+    if [[ $DDS_ONLY -eq 0 ]]; then
+        sections+=("ROS2 nodes:ROS_PATTERNS[@]")
+    fi
+    if [[ $DAEMON_ONLY -eq 0 && $DDS_ONLY -eq 0 ]]; then
+        sections+=("DDS middleware:DDS_PATTERNS[@]")
+    fi
+    [[ $INCLUDE_GAZEBO -eq 1 ]] && sections+=("Gazebo/Ignition:GAZEBO_PATTERNS[@]")
+
+    # Kill daemon gracefully first
+    if [[ $DAEMON_ONLY -eq 0 && $DDS_ONLY -eq 0 ]]; then
+        kill_daemon
+    fi
+
+    for section in "${sections[@]}"; do
+        local label="${section%%:*}"
+        local patterns_ref="${section##*:}"
+        local -n patterns_arr="$patterns_ref"
+
+        local pids=()
+        collect_pids pids "${patterns_arr[@]}"
+
+        echo -e "\n${BLU}▸ ${label} (${#pids[@]} found)${RST}"
+
+        if [[ ${#pids[@]} -eq 0 ]]; then
+            echo -e "  ${DIM}nothing to kill${RST}"
+            continue
+        fi
+
+        for pid in "${pids[@]}"; do
+            print_process "$pid"
+            kill_pid "$pid"
+            ((total++)) || true
+        done
+    done
+
+    # Wait briefly then check for survivors (SIGTERM may need a moment)
+    if [[ $DRY_RUN -eq 0 && $FORCE -eq 0 && $total -gt 0 ]]; then
+        sleep 0.5
+        local survivors=()
+        local all_patterns=("${ROS_PATTERNS[@]}" "${DDS_PATTERNS[@]}")
+        collect_pids survivors "${all_patterns[@]}"
+
+        if [[ ${#survivors[@]} -gt 0 ]]; then
+            echo -e "\n${YLW}▸ Survivors (sending SIGKILL)${RST}"
+            for pid in "${survivors[@]}"; do
+                print_process "$pid"
+                kill -KILL "$pid" 2>/dev/null && \
+                    echo -e "  ${GRN}✓${RST} force-killed PID $pid" || true
+            done
+        fi
+    fi
+
+    echo ""
+    if [[ $DRY_RUN -eq 1 ]]; then
+        echo -e "${YLW}Dry run complete. Nothing was killed.${RST}"
+    else
+        echo -e "${GRN}Done.${RST} ROS2 environment cleared."
+        echo -e "${DIM}Tip: source your workspace again before launching nodes.${RST}"
+    fi
+}
+
+# ── Parse args ────────────────────────────────────────────────
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --dry-run)    DRY_RUN=1 ;;
+        --node)       shift; TARGET_NODE="$1" ;;
+        --daemon)     DAEMON_ONLY=1 ;;
+        --dds)        DDS_ONLY=1 ;;
+        --gazebo)     INCLUDE_GAZEBO=1 ;;
+        --list)       LIST_ONLY=1 ;;
+        --force)      FORCE=1 ;;
+        --verbose|-v) VERBOSE=1 ;;
+        --version)    echo "ros-kill-all v${VERSION}"; exit 0 ;;
+        --help|-h)    usage; exit 0 ;;
+        *)            echo "Unknown option: $1"; usage; exit 1 ;;
+    esac
+    shift
+done
+
+# ── Entrypoint ────────────────────────────────────────────────
+
+# Must be Linux
+if [[ "$(uname)" != "Linux" ]]; then
+    echo -e "${RED}Error: ros-kill-all requires Linux.${RST}"
+    exit 1
+fi
+
+echo -e "${BLU}ros-kill-all${RST} v${VERSION}"
+echo -e "${DIM}────────────────────────────────────${RST}"
+
+if [[ $LIST_ONLY -eq 1 ]]; then
+    list_processes
+    exit 0
+fi
+
+if [[ -n "$TARGET_NODE" ]]; then
+    kill_by_node_name "$TARGET_NODE"
+    exit $?
+fi
+
+if [[ $DAEMON_ONLY -eq 1 ]]; then
+    kill_daemon
+    exit 0
+fi
+
+kill_all

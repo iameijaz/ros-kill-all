@@ -1,0 +1,49 @@
+name: Build and Test
+
+on:
+  push:
+    branches: [ "main", "develop" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Check syntax
+      run: bash -n ros-kill-all
+
+    - name: Install shellcheck
+      run: sudo apt-get install -y shellcheck
+
+    - name: Lint with shellcheck
+      run: shellcheck ros-kill-all
+
+    - name: Test --version
+      run: ./ros-kill-all --version
+
+    - name: Test --help
+      run: ./ros-kill-all --help
+
+    - name: Test --list (no ROS2 installed — should return cleanly)
+      run: ./ros-kill-all --list
+
+    - name: Test --dry-run
+      run: ./ros-kill-all --dry-run
+
+    - name: Test --daemon --dry-run
+      run: ./ros-kill-all --daemon --dry-run
+
+    - name: Test --dds --dry-run
+      run: ./ros-kill-all --dds --dry-run
+
+    - name: Test make install
+      run: |
+        sudo make install
+        which ros-kill-all
+        ros-kill-all --version
+
+    - name: Test make uninstall
+      run: sudo make uninstall

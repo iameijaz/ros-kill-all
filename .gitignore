@@ -1,0 +1,4 @@
+# nothing to build — script only
+*.swp
+*~
+.DS_Store
