@@ -121,7 +121,7 @@ find_pids_by_pattern() {
 
 get_cmdline() {
     local pid=$1
-    cat /proc/$pid/cmdline 2>/dev/null | tr '\0' ' ' | head -c 120
+    cat /proc/"$pid"/cmdline 2>/dev/null | tr '\0' ' ' | head -c 120
 }
 
 print_process() {
@@ -291,8 +291,9 @@ kill_all() {
             echo -e "\n${YLW}▸ Survivors (sending SIGKILL)${RST}"
             for pid in "${survivors[@]}"; do
                 print_process "$pid"
-                kill -KILL "$pid" 2>/dev/null && \
-                    echo -e "  ${GRN}✓${RST} force-killed PID $pid" || true
+                if kill -KILL "$pid" 2>/dev/null; then
+                    echo -e "  ${GRN}✓${RST} force-killed PID $pid"
+                fi
             done
         fi
     fi
