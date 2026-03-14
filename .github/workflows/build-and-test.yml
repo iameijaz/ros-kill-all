@@ -12,6 +12,9 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
+    - name: Make executable
+      run: chmod +x ros-kill-all
+
     - name: Check syntax
       run: bash -n ros-kill-all
 
