@@ -121,7 +121,7 @@ find_pids_by_pattern() {
 
 get_cmdline() {
     local pid=$1
-    cat /proc/"$pid"/cmdline 2>/dev/null | tr '\0' ' ' | head -c 120
+    tr '\0' ' ' < /proc/"$pid"/cmdline 2>/dev/null | head -c 120
 }
 
 print_process() {
